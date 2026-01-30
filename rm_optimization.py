@@ -1,8 +1,11 @@
 import casadi as ca 
 import matplotlib.pyplot as plt
 import numpy as np
+from robot import Robot
+import pinocchio
+from scipy.optimize import minimize 
 
-def robot_motion_optimization():
+def distance_minimization():
     '''Minimalizuj długość łamanej (20 odcinków) unikając kolizji z 3 kolistymi przeszkodami.'''
     opti = ca.Opti()
 
@@ -110,5 +113,195 @@ def robot_motion_optimization():
     print(f"Optimal path length: {real_length:.4f}")
     print(f"Number of segments: {n_points - 1}")
 
+
+
+def robot_motion_optimization():
+    """
+    Optymalizacja ruchu robota: minimalizacja długości ścieżki końcówki roboczej
+    z zachowaniem orientacji pionowej i osiągnięciem końca w zadanej kuli.
+    """
+    urdf_path = "iiwa_cup.urdf"
+    robot = Robot(urdf_path=urdf_path)
+    model = robot.model
+
+    n_points = 21  # liczba punktów trajektorii (w tym start i koniec)
+    nq = model.nq  # liczba stopni swobody
+
+    opti = ca.Opti()
+    Q = opti.variable(n_points, nq)  # zmienne decyzyjne: konfiguracje robota
+
+    # Parametry zadania
+    q_start = pinocchio.neutral(model)
+    # Przykładowa kula celu (środek i promień w przestrzeni zadania)
+    goal_center = np.array([0.6, 0.0, 0.7])
+    goal_radius = 0.08
+
+    # Ograniczenie: konfiguracja początkowa
+    opti.subject_to([Q[0, j] == q_start[j] for j in range(nq)])
+
+    # Ograniczenie: końcówka robocza w kuli na końcu
+    for i in range(n_points):
+        # Pozycja i orientacja końcówki roboczej dla każdego punktu
+        q_i = Q[i, :]
+        # Użyj CasADi funkcji do forward kinematics
+        q_i_np = ca.MX.sym('q', nq)
+        pinocchio.forwardKinematics(model, robot.data, q_i_np)
+        pinocchio.updateFramePlacements(model, robot.data)
+        ee_frame_id = model.getFrameId("F_link_ee")
+        ee_pos = robot.data.oMf[ee_frame_id].translation
+
+        # Zachowanie orientacji pionowej (oś Z narzędzia równoległa do Z świata)
+        ee_rot = robot.data.oMf[ee_frame_id].rotation
+        z_axis = ee_rot[:, 2]
+        opti.subject_to(z_axis[0] == 0)
+        opti.subject_to(z_axis[1] == 0)
+        opti.subject_to(z_axis[2] >= 0.99)  # tolerancja
+
+        if i == n_points - 1:
+            # Ograniczenie końcowe: pozycja końcówki w kuli
+            opti.subject_to(ca.sumsqr(ee_pos - goal_center) <= goal_radius**2)
+
+    # Funkcja celu: suma długości odcinków w przestrzeni zadania
+    total_length = 0
+    for i in range(n_points - 1):
+        total_length += ca.norm_2(Q[i+1, :] - Q[i, :])
+    opti.minimize(total_length)
+
+    opti.minimize(total_length)
+
+    # Inicjalizacja (np. liniowa interpolacja w przestrzeni konfiguracyjnej)
+    for j in range(nq):
+        opti.set_initial(Q[:, j], np.linspace(q_start[j], q_start[j], n_points))
+
+    # Rozwiązanie
+    opts = {
+        'ipopt.print_level': 3,
+        'ipopt.max_iter': 1000,
+        'ipopt.tol': 1e-4,
+    }
+    opti.solver('ipopt', opts)
+    sol = opti.solve()
+
+    Q_sol = np.array(opti.value(Q))
+    print("Optymalna trajektoria w przestrzeni konfiguracyjnej:")
+    print(Q_sol)
+
+    # (Opcjonalnie) wizualizacja trajektorii końcówki roboczej
+    ee_traj = []
+    for i in range(n_points):
+        pinocchio.forwardKinematics(model, robot.data, Q_sol[i, :])
+        pinocchio.updateFramePlacements(model, robot.data)
+        ee_traj.append(robot.data.oMf[ee_frame_id].translation.copy())
+    ee_traj = np.array(ee_traj)
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.plot(ee_traj[:, 0], ee_traj[:, 1], ee_traj[:, 2], 'b.-', label='trajektoria EE')
+    ax.scatter(goal_center[0], goal_center[1], goal_center[2], c='r', label='środek kuli celu')
+    ax.legend()
+    plt.show()
+
+
+def robot_motion_optimization_scipy():
+    """
+    Optymalizacja ruchu robota: minimalizacja długości ścieżki końcówki roboczej
+    z zachowaniem orientacji pionowej i osiągnięciem końca w zadanej kuli,
+    z użyciem Pinocchio + scipy.optimize.minimize (wszystko na numpy).
+    """
+    urdf_path = "iiwa_cup.urdf"
+    robot = Robot(urdf_path=urdf_path)
+    model = robot.model
+    data = robot.data
+
+    n_points = 21  # liczba punktów trajektorii (w tym start i koniec)
+    nq = model.nq  # liczba stopni swobody
+
+    q_start = pinocchio.neutral(model)
+    goal_center = np.array([0.6, 0.0, 0.7])
+    goal_radius = 0.08
+    ee_frame_id = model.getFrameId("F_link_ee")
+
+    # Inicjalizacja: powiel q_start
+    Q0 = np.tile(q_start, (n_points, 1))
+    Q0_flat = Q0.flatten()
+
+    def objective(Q_flat):
+        Q = Q_flat.reshape((n_points, nq))
+        total_length = 0
+        for i in range(n_points - 1):
+            pinocchio.forwardKinematics(model, data, Q[i])
+            pinocchio.updateFramePlacements(model, data)
+            ee1 = data.oMf[ee_frame_id].translation.copy()
+            pinocchio.forwardKinematics(model, data, Q[i+1])
+            pinocchio.updateFramePlacements(model, data)
+            ee2 = data.oMf[ee_frame_id].translation.copy()
+            total_length += np.linalg.norm(ee2 - ee1)
+        return total_length
+
+    def constraint_start(Q_flat):
+        Q = Q_flat.reshape((n_points, nq))
+        return Q[0] - q_start  # == 0
+
+    def constraint_goal(Q_flat):
+        Q = Q_flat.reshape((n_points, nq))
+        pinocchio.forwardKinematics(model, data, Q[-1])
+        pinocchio.updateFramePlacements(model, data)
+        ee = data.oMf[ee_frame_id].translation
+        return goal_radius**2 - np.sum((ee - goal_center)**2)  # >= 0
+
+    def constraint_vertical(Q_flat):
+        Q = Q_flat.reshape((n_points, nq))
+        min_z = []
+        for i in range(n_points):
+            pinocchio.forwardKinematics(model, data, Q[i])
+            pinocchio.updateFramePlacements(model, data)
+            ee_rot = data.oMf[ee_frame_id].rotation
+            z_axis = ee_rot[:, 2]
+            # z_axis[0] == 0, z_axis[1] == 0, z_axis[2] >= 0.99
+            min_z.append(z_axis[2] - 0.99)
+        return np.array(min_z)  # >= 0
+
+    def constraint_step(Q_flat):
+        Q = Q_flat.reshape((n_points, nq))
+        max_step = 0.2  # możesz dobrać wartość
+        steps = []
+        for i in range(n_points - 1):
+            steps.append(max_step - np.linalg.norm(Q[i+1] - Q[i]))
+        return np.array(steps)  # >= 0
+
+    constraints = [
+    {'type': 'eq', 'fun': constraint_start},
+    {'type': 'ineq', 'fun': constraint_goal},
+    {'type': 'ineq', 'fun': constraint_vertical},
+    {'type': 'ineq', 'fun': constraint_step},
+    ]
+
+    result = minimize(
+        objective,
+        Q0_flat,
+        method='SLSQP',
+        constraints=constraints,
+        options={'maxiter': 200, 'ftol': 1e-3, 'disp': True}
+    )
+
+    Q_sol = result.x.reshape((n_points, nq))
+    print("Optymalna trajektoria w przestrzeni konfiguracyjnej:")
+    print(Q_sol)
+
+    # Wizualizacja trajektorii końcówki roboczej
+    ee_traj = []
+    for i in range(n_points):
+        pinocchio.forwardKinematics(model, data, Q_sol[i, :])
+        pinocchio.updateFramePlacements(model, data)
+        ee_traj.append(data.oMf[ee_frame_id].translation.copy())
+    ee_traj = np.array(ee_traj)
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.plot(ee_traj[:, 0], ee_traj[:, 1], ee_traj[:, 2], 'b.-', label='trajektoria EE')
+    ax.scatter(goal_center[0], goal_center[1], goal_center[2], c='r', label='środek kuli celu')
+    ax.legend()
+    plt.show()
+
+
 if __name__ == '__main__':
-    robot_motion_optimization()
+    # distance_minimization()
+    robot_motion_optimization_scipy()
